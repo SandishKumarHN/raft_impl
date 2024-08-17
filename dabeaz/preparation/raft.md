@@ -1,0 +1,209 @@
+#### Raft Lecture (Raft user study); https://youtu.be/YbZ3zDzDnrw?si=KNwkW9MchMfY_m-V
+
+### Raft: A Consensus Algorithm for Replicated Logs
+Overall goal of the raft is to replicate a log entries identially across collection of server's. (A Replicated State Machine)
+
+Two possible approach for consensus
+- Symetric, leader-less
+    - all servers will have equal roles and any client can talk to any server
+- Asymetric, leader-based
+    - At any given point on server is in-charge, others accets it's decision
+    - Clients communicate with the leader
+- Raft uses a leader:
+    - Decomposes the problem(normal operation, leader changes)
+    - Simplifies nomral operation (no conflicts)
+    - More efficient than leader-less approaches
+
+### Raft Overview
+- Leader election
+    - select one of the servers to act as leader
+    - Detect crashes, choose new leader
+    - heartbeats and timeouts
+        - Server start up as followers
+        - Followers expect to receive RPCs from leaders or candidates
+        - Leaders must send heartbeats(empty AppendEntries RPCs) to maintain authority
+        - if electionm timeouts elaspses with no RPCs
+            - follower assumes leader has crashed
+            - follower starts new election
+            - timeouts typically 100-500ms
+    - election basics
+        - increment current term
+        - change to candidate state
+        - vote for self
+        - send RequestVote RPCs to other servers, retry until either:
+            - Receive votes from majority of servers
+                - Become leader
+                - Send AppendEntries heartbeats to all other servers
+        - Receive RPC from valid leader
+            - Return to follower state
+        - No-one wins election (election timeout elapses)
+            - increment term, start new election
+    - Safty and Liveness
+        - Safty, allow at most one winner per term
+            - each server gives out only one vote per term (persist on disk)
+            - two different candidates can't accumulate majorities in same term
+        - Liveness, some candidate must eventually win
+            - Choose election timeouts randomly in [T, 2T]
+            - One server usually times out and wins election before others wake up
+            - Works well if T >> broadcast time
+- Normal operation (basic log replication)
+    - Log Structure
+        - Log Entry = index, term, command
+        - Log Stored on stable storage(disk); survives crashes, 
+        - Entry `committed`  if known to be stored on majority of servers
+            - durable, will eventually be executed by state machines
+    - Noraml operations
+        - Client sends command to leader
+        - Leader appends command to Log
+        - Leader send AppendEntries RPCs to followers
+        - Once new entry committed:
+            - leader passes command to its state machine, returns result to client
+            - leader notifies followers of committed entries in subsequent AppendEntries RPCs
+            - Followers passe committed commands to their state machines
+        - Crashed/Slow followers
+            - leader retries RPCs until they succeed
+        - Performance is optimal in common case:
+            - One successful RPC to any majority of servers. 
+    - Log Consistency
+        - High level of coherency between logs
+            - if log entries on different servers have same term and index
+                - they store the same command
+                - the logs are indentical in all preceding entries
+            - if a given entry is committed, all preceding entries are also committed
+    - Append Entries consistency check
+        - Each AppendEntry RPC contains index, term of entry preceding new ones
+        - Follower must contain matching entry; otherwise it rejects request
+        - Implements an induction step, ensures coherency
+- Safety and consistency after leader changes
+    - Leader changes
+        - At the begining of new leader term
+            - Old leader may have left entries paryialy replicated. 
+            - No special steps by new leader: just start normal operation
+            - leaders log is "the truth"
+            - will eventually make follower's logs identical to leader's 
+            - multiple crashes can leave many extraneous log entries. 
+    - Safty requirement
+        - Once a log entry has been applied to a state machine, no other state machine must apply a different value for that log entry
+        - raft safety property
+            - if a leader has decided that a log entry is commited, that entry will be present in the logs of all future leaders
+        - This guarantees the safety requirement
+            - leaders never overwrite entries in their logs
+            - only entries in the leaders log can be commited
+            - entries must be committed before applying to state machine
+            - Commited - Persent in future leaders(if a candidate state has descrepency then do not allow to become a leader)
+    - Picking the best leader
+        - can't tell which entries are committed
+            - candidate has all committed entries but the one of the followers is unavailable during the leader transition
+            - during elections, choose candidate with log most likely to contain all committed entries
+                - candidates include log info in RequestVote RPCs (index & term of last log entry)
+                - Voting server V denies vote if its log is "more complete"
+                    - (lastTermV > lastTermC) || (lastTermV == lastTermC) && (lastIndexV > lastIndesxC)
+                - Leader will have "most complete" log among electing majority
+    - Committing Entry from current term
+        - Case #1/2: leader decides entry in current term is committed
+        - Safe: leader for term 3 must contain entry 4
+    - Coommiting entry from earlier term
+        - Case #2/2: leader is trying to finish committing entry from an earlier term
+        - Entry 3 not safely committed
+            - s5 can be elected as leader for term 5
+            - if elected, it will overwrite entry 3 on s1, s2, and s3!
+    - New committement rules
+        - For a new leader to decide on entry is committed
+            - must be stored on a majority of servers
+            - At least one new entry from leader's term must also be stored on majority of servers
+        - Once entry 4 committed
+            - s5 cannot be elected leader
+            - entries 3 and 4 both safe
+    - Combination of election rules and committed rules makes raft safe.
+    - Log Inconsistencies
+        - leader changes can result in log inconsistencies, 
+            - followers can have missing entries and extra entries
+            - get rid of extra entries from follwoers
+            - fill in all of the missing entries in the follwers from leaders log
+    - Repairing followers logs
+        - TL;DR: to restore log consistency, leader maintains state variable for each of the followers in the cluster called nextIndex
+        - New leader must make follower logs consistent with its own 
+            - Delete extraneous entries
+            - Fill in missing entries
+        - Leader keeps nextIndex for each follower
+            - index of next log entry send to that follower
+            - initialize to (1 + leaders last index)
+        - When AppendEntries consistenyc check fails, decrement ndexIndex and try again;
+        - When a follower overwrites inconsitency entry, it will delete all subsequent entries.
+            - any entry after an extranies entry is also an extranies
+- Neutralizing old leaders
+    - Deposed leader may not dead:
+        - Temporarily disconnected from network
+        - Other servers elect a new leader
+        - Old leader becomes reconnected, attempts to commit log entries
+    - Terms used to detect stale leaders (and candidates)
+        - Every RPC contains term of sender
+        - if sender's term is older, RPC is rejected, send reverts to follower and updates its term. 
+        - if receiver's term is older, it reverts to follower, updates its term, then processes RPC normally
+    - Election updates terms of majority of servers
+        - deposed server cannot committ new log entries. 
+- Client interactions
+    - Implementing linearizeable semantics
+    - Client Protocol 
+        - send commands to leader
+            - if leader is unknown, contact any server
+            - if contacted server not leader, it will redirect to leader
+        - leader does not respond until command has been logged, committed, and executed by leader's state machine 
+        - if request times out (e.g, leader crash's)
+            - client reissue's command to some other server
+            - eventually redirected to new leader
+            - retry request with new leader
+        - What if leader crashes after executing command, but before responding.
+            - Must not execute the command twice
+        - Solution: client embeds a unique id in each command
+            - Server includes id in log entry
+            - Before accepting the command, leader checks its log for entry with that id
+            - if id found in log, ignore new command, return response from old command
+        - Result: excatly-once semantics as long as  client doesn't crash. 
+- Configuration changes:
+    - Adding and removing servers
+    - System confirguration
+        - ID, address for each server
+        - determines what constitues a majority 
+    - Consensus mechanism must support changes in the configuration
+        - Replace failed machine
+        - Change degree of replication
+    - Cannot switch directly from one configuration to another; conflicting majorities could arise
+        - we have to use two-phase protocol
+    - Joint Consensus
+        - Raft uses a 2-phase approach
+            - Intermidiate phase uses joint consensus(need majority of both old and new configurations, commitment)
+            - Configuration change is just a log entry; applied immediately on receipt(committed or not)
+            - Once joint consensus is committed, begin replicating log entry for final configuration 
+            - once leader receive new configuration request from client
+                - it committes and lives by the new confirguation, 
+                - makes decision by old+new configuration 
+                    - any log entries needs to be committed to majority of old servers and new servers
+                - Cold+new will replicated to all followers
+                    - the followers take the Cold+new confirguration and take effect immediately
+                    - they won't wait for committed
+                - at no point in time Cold and Cnew make decision without consulting each other
+                    - but there is a period of time Cold and Cnew make decision independently but they don't overlap but inbetween both must be consulted. 
+        - Additional details;
+            - any server from either configuration can serve as leader
+            - if current leader is not in Cnew, must step down once Cnew is committed
+
+
+### Server stats
+- At any give point in time, A server is either:
+    - Leader, handles all client interactions, log replication
+        - At most 1 viable leader at a time
+    - Follower, completely passive (issues no RPCs, responds to incoming RPCs)
+    - Candidate, used to elect a new leader
+- Normal operation: 1: Leader, N-1 followers
+### Terms
+- Time divided intp terms
+    - election
+    - Normal operation under single leader
+- At most one leader per term 
+- Some terms have no leaders(failed election)
+- each server maintains current term value
+- Key role of terms: identify obsolete information
+
+### Raft protocol summary
+
