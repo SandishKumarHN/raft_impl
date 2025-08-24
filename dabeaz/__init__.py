@@ -1,0 +1,1 @@
+"""Educational examples and utilities."""
