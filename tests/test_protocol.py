@@ -5,6 +5,7 @@ from dabeaz.raft import (
     RaftNode,
     RequestVote,
 )
+from dabeaz.network import NetworkManager
 
 
 async def call(coro):
@@ -13,7 +14,8 @@ async def call(coro):
 
 def test_request_vote_granted_for_up_to_date_candidate():
     async def run():
-        follower = RaftNode("f1")
+        net = NetworkManager()
+        follower = RaftNode("f1", net)
         follower.current_term = 1
         follower.log.append(LogEntry(1, "x"))
         msg = RequestVote(1, "cand", 1, 1)
@@ -25,7 +27,8 @@ def test_request_vote_granted_for_up_to_date_candidate():
 
 def test_request_vote_rejected_if_term_old():
     async def run():
-        follower = RaftNode("f1")
+        net = NetworkManager()
+        follower = RaftNode("f1", net)
         follower.current_term = 2
         msg = RequestVote(1, "cand", 0, 0)
         res = await follower._on_request_vote("cand", msg)
@@ -36,7 +39,8 @@ def test_request_vote_rejected_if_term_old():
 
 def test_append_entries_appends_and_commits():
     async def run():
-        follower = RaftNode("f1")
+        net = NetworkManager()
+        follower = RaftNode("f1", net)
         follower.current_term = 1
         follower.log.append(LogEntry(1, "x"))
         msg = AppendEntries(

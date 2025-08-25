@@ -1,18 +1,13 @@
 from __future__ import annotations
 
-"""Core logic for a Raft server.
-
-The implementation provided here is intentionally minimal and is meant
-for educational purposes.  A ``RaftNode`` communicates with its peers by
-calling their RPC handler methods directly.  The module contains the
-state machine that drives leader election, log replication and the
-basic safety properties described in ``preparation/raft.md``.
-"""
+"""Core logic for a Raft server with a pluggable network layer."""
 
 import asyncio
 import random
-from typing import Dict, Optional
+import time
+from typing import Dict, Iterable, Optional
 
+from ..network import NetworkManager
 from .log import Log, LogEntry, WriteAheadLog
 from .messages import (
     AppendEntries,
@@ -28,35 +23,39 @@ class RaftNode:
 
     heartbeat_interval = 0.05
 
-    def __init__(self, node_id: str, *, wal_path: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        node_id: str,
+        network: NetworkManager,
+        *,
+        wal_path: Optional[str] = None,
+    ) -> None:
         self.id = node_id
+        self.network = network
+        self.network.register(self)
         self.state: State = State.FOLLOWER
         self.current_term = 0
         self.voted_for: Optional[str] = None
         self.log = WriteAheadLog(wal_path) if wal_path else Log()
         self.commit_index = 0
         self.last_applied = 0
-        self.peers: Dict[str, "RaftNode"] = {}
+        self.peers: list[str] = []
         self.next_index: Dict[str, int] = {}
         self.match_index: Dict[str, int] = {}
-        self._inbox: "asyncio.Queue[tuple[str, object]]" = asyncio.Queue()
+        self.state_machine: Dict[str, str] = {}
         self._stop = asyncio.Event()
+        self._reset_election_timer()
 
     # ------------------------------------------------------------------
     # Cluster configuration
     # ------------------------------------------------------------------
-    def set_peers(self, peers: Dict[str, "RaftNode"]) -> None:
-        """Configure peer nodes for this server."""
-
-        # Do not include ourselves in the peer mapping
-        self.peers = {pid: p for pid, p in peers.items() if pid != self.id}
+    def set_peers(self, peers: Iterable[str]) -> None:
+        self.peers = [pid for pid in peers if pid != self.id]
 
     # ------------------------------------------------------------------
     # High level API
     # ------------------------------------------------------------------
     async def start(self) -> None:
-        """Start the node's main loop."""
-
         while not self._stop.is_set():
             if self.state == State.FOLLOWER:
                 await self._run_follower()
@@ -69,41 +68,18 @@ class RaftNode:
         self._stop.set()
 
     async def apply_command(self, command: object) -> None:
-        """Append a command to the log.  Only valid for leaders."""
-
         if self.state != State.LEADER:
             raise RuntimeError("only the leader may accept commands")
         self.log.append(LogEntry(self.current_term, command))
 
     # ------------------------------------------------------------------
-    # Message handling
-    # ------------------------------------------------------------------
-    async def send(self, peer_id: str, message: object) -> None:
-        await self.peers[peer_id]._inbox.put((self.id, message))
-
-    async def _recv(self, timeout: Optional[float]) -> Optional[tuple[str, object]]:
-        try:
-            return await asyncio.wait_for(self._inbox.get(), timeout)
-        except asyncio.TimeoutError:
-            return None
-
-    async def _handle_rpc(self, sender: str, message: object) -> None:
-        if isinstance(message, RequestVote):
-            await self._on_request_vote(sender, message)
-        elif isinstance(message, AppendEntries):
-            await self._on_append_entries(sender, message)
-
-    # ------------------------------------------------------------------
     # Follower behaviour
     # ------------------------------------------------------------------
     async def _run_follower(self) -> None:
-        timeout = self._election_timeout()
-        msg = await self._recv(timeout)
-        if msg is None:
+        if time.monotonic() >= self._election_deadline:
             self.state = State.CANDIDATE
-            return
-        sender, rpc = msg
-        await self._handle_rpc(sender, rpc)
+        else:
+            await asyncio.sleep(0.01)
 
     # ------------------------------------------------------------------
     # Candidate behaviour
@@ -114,9 +90,9 @@ class RaftNode:
         votes = 1
         last_idx = self.log.last_index()
         last_term = self.log.last_term()
-        for pid, peer in self.peers.items():
+        for pid in self.peers:
             req = RequestVote(self.current_term, self.id, last_idx, last_term)
-            res = await peer._on_request_vote(self.id, req)
+            res = await self.network.rpc(self.id, pid, "_on_request_vote", req)
             if res.vote_granted:
                 votes += 1
         if votes > len(self.peers) // 2:
@@ -124,9 +100,9 @@ class RaftNode:
             for pid in self.peers:
                 self.next_index[pid] = self.log.last_index() + 1
                 self.match_index[pid] = 0
-            return
-        # Election failed; wait before trying again
-        await asyncio.sleep(self._election_timeout())
+        else:
+            await asyncio.sleep(self._election_timeout())
+        self._reset_election_timer()
 
     # ------------------------------------------------------------------
     # Leader behaviour
@@ -134,6 +110,7 @@ class RaftNode:
     async def _run_leader(self) -> None:
         for pid in self.peers:
             await self._send_append_entries(pid)
+        self._advance_commit_index()
         await asyncio.sleep(self.heartbeat_interval)
 
     # ------------------------------------------------------------------
@@ -151,15 +128,19 @@ class RaftNode:
             and self._log_is_up_to_date(msg.last_log_index, msg.last_log_term)
         ):
             self.voted_for = msg.candidate_id
+            self._reset_election_timer()
             return RequestVoteResult(self.current_term, True)
         return RequestVoteResult(self.current_term, False)
 
-    async def _on_append_entries(self, sender: str, msg: AppendEntries) -> AppendEntriesResult:
+    async def _on_append_entries(
+        self, sender: str, msg: AppendEntries
+    ) -> AppendEntriesResult:
         if msg.term < self.current_term:
             return AppendEntriesResult(self.current_term, False, self.log.last_index())
         self.state = State.FOLLOWER
         self.current_term = msg.term
         self.voted_for = sender
+        self._reset_election_timer()
         if msg.prev_log_index > 0:
             if msg.prev_log_index > self.log.last_index():
                 return AppendEntriesResult(self.current_term, False, self.log.last_index())
@@ -172,11 +153,15 @@ class RaftNode:
             self.log.append(*msg.entries)
         if msg.leader_commit > self.commit_index:
             self.commit_index = min(msg.leader_commit, self.log.last_index())
+            self._apply_committed()
         return AppendEntriesResult(self.current_term, True, self.log.last_index())
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _reset_election_timer(self) -> None:
+        self._election_deadline = time.monotonic() + self._election_timeout()
+
     def _election_timeout(self) -> float:
         return random.uniform(0.15, 0.3)
 
@@ -189,7 +174,11 @@ class RaftNode:
     async def _send_append_entries(self, peer_id: str) -> None:
         next_idx = self.next_index[peer_id]
         prev_idx = next_idx - 1
-        prev_term = self.log.entry(prev_idx).term if prev_idx > 0 and self.log.last_index() >= prev_idx else 0
+        prev_term = (
+            self.log.entry(prev_idx).term
+            if prev_idx > 0 and self.log.last_index() >= prev_idx
+            else 0
+        )
         entries = self.log.slice(next_idx) if next_idx <= self.log.last_index() else []
         msg = AppendEntries(
             term=self.current_term,
@@ -199,9 +188,32 @@ class RaftNode:
             entries=entries,
             leader_commit=self.commit_index,
         )
-        res = await self.peers[peer_id]._on_append_entries(self.id, msg)
+        res = await self.network.rpc(self.id, peer_id, "_on_append_entries", msg)
         if res.success:
             self.match_index[peer_id] = res.match_index
             self.next_index[peer_id] = res.match_index + 1
         else:
             self.next_index[peer_id] = max(1, self.next_index[peer_id] - 1)
+
+    def _advance_commit_index(self) -> None:
+        for N in range(self.log.last_index(), self.commit_index, -1):
+            count = 1  # include leader
+            for match in self.match_index.values():
+                if match >= N:
+                    count += 1
+            if count > len(self.peers) // 2 and self.log.entry(N).term == self.current_term:
+                self.commit_index = N
+                self._apply_committed()
+                break
+
+    def _apply_committed(self) -> None:
+        if self.commit_index > self.last_applied:
+            for idx in range(self.last_applied + 1, self.commit_index + 1):
+                self._apply_entry(self.log.entry(idx))
+            self.last_applied = self.commit_index
+
+    def _apply_entry(self, entry: LogEntry) -> None:
+        cmd = entry.command
+        if isinstance(cmd, tuple) and cmd[0] == "set" and len(cmd) == 3:
+            _, key, value = cmd
+            self.state_machine[key] = value
