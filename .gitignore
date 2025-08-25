@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.swp
+*.swo
+.Python
+.env
+.venv
+ENV/
+venv/
+.idea/
+.vscode/
+# Byte-compiled / optimized / DLL files
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+# Pytest cache
+.pytest_cache/
+
