@@ -28,3 +28,17 @@ class KeyValueClient:
         if leader is None:
             raise RuntimeError("no leader available")
         return leader.state_machine.get(key)
+
+    async def delete(self, key: str) -> None:
+        """Remove *key* from the cluster."""
+
+        leader = self.cluster.leader()
+        retries = 5
+        while leader is None and retries:
+            await asyncio.sleep(0.05)
+            leader = self.cluster.leader()
+            retries -= 1
+        if leader is None:
+            raise RuntimeError("no leader available")
+        await leader.apply_command(("del", key))
+        await asyncio.sleep(0.05)

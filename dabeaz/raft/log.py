@@ -53,6 +53,10 @@ class Log:
     def delete_from(self, index: int) -> None:
         del self._entries[index - 1 :]
 
+    def checkpoint(self) -> None:  # pragma: no cover - simple no-op
+        """Persist the log to durable storage if needed."""
+        return None
+
 
 class WriteAheadLog(Log):
     """Log implementation backed by a write-ahead log on disk."""
@@ -79,6 +83,10 @@ class WriteAheadLog(Log):
             self._fh.flush()
             os.fsync(self._fh.fileno())
             self._entries.append(entry)
+
+    def checkpoint(self) -> None:
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
 
     def close(self) -> None:
         self._fh.close()

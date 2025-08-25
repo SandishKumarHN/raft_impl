@@ -17,6 +17,7 @@ async def run_cluster():
     for (node, timeout) in zip(nodes.values(), timeouts):
         node._election_timeout = types.MethodType(lambda self, t=timeout: t, node)
         node.heartbeat_interval = 0.01
+        node._reset_election_timer()
 
     tasks = [asyncio.create_task(n.start()) for n in nodes.values()]
     await asyncio.sleep(0.2)

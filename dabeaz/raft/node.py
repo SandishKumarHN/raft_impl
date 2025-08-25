@@ -214,6 +214,10 @@ class RaftNode:
 
     def _apply_entry(self, entry: LogEntry) -> None:
         cmd = entry.command
-        if isinstance(cmd, tuple) and cmd[0] == "set" and len(cmd) == 3:
-            _, key, value = cmd
-            self.state_machine[key] = value
+        if isinstance(cmd, tuple):
+            if cmd[0] == "set" and len(cmd) == 3:
+                _, key, value = cmd
+                self.state_machine[key] = value
+            elif cmd[0] == "del" and len(cmd) == 2:
+                _, key = cmd
+                self.state_machine.pop(key, None)

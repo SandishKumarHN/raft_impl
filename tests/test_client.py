@@ -18,14 +18,17 @@ def test_client_kv():
         for (node, timeout) in zip(nodes.values(), timeouts):
             node._election_timeout = types.MethodType(lambda self, t=timeout: t, node)
             node.heartbeat_interval = 0.01
+            node._reset_election_timer()
         tasks = [asyncio.create_task(n.start()) for n in nodes.values()]
         await asyncio.sleep(0.2)
         client = KeyValueClient(cluster)
         await client.set("a", "1")
-        val = await client.get("a")
+        val1 = await client.get("a")
+        await client.delete("a")
+        val2 = await client.get("a")
         for node in nodes.values():
             node.stop()
         await asyncio.gather(*tasks)
-        return val
+        return val1, val2
 
-    assert asyncio.run(run()) == "1"
+    assert asyncio.run(run()) == ("1", None)
